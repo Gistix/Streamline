@@ -292,6 +292,7 @@ static void ffxApiLogMessage(uint32_t type, const wchar_t* message)
     }
 }
 
+
 // Inverse of ffxStateToLayout: map a resource's current VkImageLayout back to an FFX state enum. Used for
 // present-time resources (HUDLessColor) that must be declared to FFX in the layout DXVK already has them in,
 // without recording a transition in our evaluate command buffer.
@@ -331,8 +332,10 @@ void recordBarrier(fsr::FSRContext& ctx, VkCommandBuffer cmd, const Barrier& b)
     mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     mb.image = b.image;
     mb.subresourceRange = { b.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
-    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
-    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT |
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    mb.dstAccessMask = (b.newLayout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) ? 0 :
+        (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     ctx.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
         0, 0, nullptr, 0, nullptr, 1, &mb);
 }
@@ -690,17 +693,12 @@ static bool applyFramePacingTuning(fsr::FSRContext& ctx)
         pacing.safetyMarginInMs = fsrgEnvFloat("CS_FSRFG_SAFETY", ctx.fgPacingSafetyMs);
         pacing.varianceFactor   = fsrgEnvFloat("CS_FSRFG_VARIANCE", ctx.fgPacingVariance);
     }
-    // The rest were left zero-initialised, which is not the same as FFX's defaults:
-    // hybridSpinTime documents a default of 2 and warns that going below it "will result in
-    // frequent overshoots", and zero is below it. With allowHybridSpin and
-    // allowWaitForSingleObjectOnFence both false the pacer busy-spins the whole inter-frame
-    // gap, and once that gap is long it overshoots and emits the interpolated frame alongside
-    // the real one instead of between them -- measured on a 60 Hz display at a 20 fps cap as
-    // a display cadence alternating one refresh interval and then the remainder, for a
-    // frame-time deviation of 48.8 ms with half of all frames beyond twice the median.
+    // Use FFX's default hybrid spin (2 slices) so the pacer sleeps across most of the inter-frame
+    // gap instead of busy-spinning and overshooting. allowWaitForSingleObjectOnFence must be false
+    // on Vulkan because VkFence is not a Win32 event HANDLE.
     pacing.allowHybridSpin  = true;
     pacing.hybridSpinTime   = 2;
-    pacing.allowWaitForSingleObjectOnFence = true;
+    pacing.allowWaitForSingleObjectOnFence = false;
     ffxConfigureDescFrameGenerationSwapChainKeyValueVK kv{};
     kv.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_KEYVALUE_VK;
     kv.header.pNext = nullptr;
@@ -909,13 +907,12 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
     if (!common::getConsts(evd, &consts))
         return Result::eErrorMissingConstants;
 
-    CommonResource depth{}, mvec{};
+    CommonResource depth{}, mvec{}, hudless{};
     // The FG viewport carries no color. The host tags depth, motion vectors, and HUDLessColor on a dedicated
-    // frame-generation viewport every frame so FSR frame generation
-    // works under any upscaler. Render size is derived from the depth extent.
+    // frame-generation viewport every frame so FSR frame generation works under any upscaler. Render size is
+    // derived from the depth extent.
     getTaggedResource(kBufferTypeDepth, depth, evd.frame, evd.id, false, inputs, numInputs);
     getTaggedResource(kBufferTypeMotionVectors, mvec, evd.frame, evd.id, false, inputs, numInputs);
-    CommonResource hudless{};
     getTaggedResource(kBufferTypeHUDLessColor, hudless, evd.frame, evd.id, true, inputs, numInputs);
     if (!depth || !mvec || !hudless)
         return Result::eErrorMissingInputParameter;
@@ -956,87 +953,120 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
     if (fgEnabled) {
         ctx.fgGameplayReached.store(true, std::memory_order_release);
         fsr::FrameGenerationFrame frame{};
-        bool hudlessWrapped = false;
 
-        // Capture HUDLessColor for present-time UI extraction. Its exact format and current DXVK layout must
-        // match the frame-generation backbuffer contract.
-        if (chi::Resource hres = hudless; hres && hres->native) {
-            chi::ResourceDescription hdesc{};
-            ctx.compute->getResourceDescription(hres, hdesc);
-            VkImage himage = (VkImage)hres->native;
-            const VkFormat hfmt = (VkFormat)hdesc.nativeFormat;
-            const bool compatible = ctx.fgBackBufferVkFormat != VK_FORMAT_UNDEFINED &&
-                hfmt == ctx.fgBackBufferVkFormat;
-            if (compatible) {
-                VkImageCreateInfo hinfo = imageInfoFromDesc(hdesc);
-                FfxApiResourceDescription hfdesc = ffxApiGetImageResourceDescriptionVK(himage, hinfo, FFX_API_RESOURCE_USAGE_READ_ONLY);
-                frame.hudlessResource = ffxApiGetResourceVK(
-                    reinterpret_cast<void*>(himage), hfdesc, layoutToFfxState((VkImageLayout)hres->state));
-                frame.haveHudless = frame.hudlessResource.resource != nullptr;
-                if (frame.haveHudless) {
-                    frame.hudlessCompatible = true;
-                    hudlessWrapped = true;
-                }
-            } else {
-                SL_LOG_WARN("sl.fsr_g: HUD-less format %d does not match backbuffer format %d",
-                    (int)hfmt, (int)ctx.fgBackBufferVkFormat);
-            }
-        }
+        if (ctx.fgContext && ctx.fgSwapchainContext && ctx.fgWrappedSwapchain != VK_NULL_HANDLE) {
+            bool hudlessWrapped = false;
 
-        if (!hudlessWrapped)
-            evaluationResult = Result::eErrorComputeFailed;
-
-        if (hudlessWrapped && ctx.fgContext && ctx.fgSwapchainContext && ctx.fgWrappedSwapchain != VK_NULL_HANDLE) {
-            ffxDispatchDescFrameGenerationPrepare prep{};
-            prep.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
-            prep.flags = 0;
-            prep.commandList = reinterpret_cast<void*>(cmd);
-            prep.renderSize = { renderW, renderH };
-            prep.jitterOffset = jitterOffset;
-            prep.motionVectorScale = motionVectorScale;
-            // Real frame delta (QPC between prepares), not a hardcoded 60Hz value:
-            // FFX scales its motion field by this, so at uncapped/high FPS a wrong
-            // constant mis-scales interpolation motion.
-            {
-                LARGE_INTEGER qpcNow;
-                QueryPerformanceCounter(&qpcNow);
-                float deltaMs = 16.6f;
-                if (ctx.fgLastPrepareQpc) {
-                    LARGE_INTEGER qpcFreq;
-                    QueryPerformanceFrequency(&qpcFreq);
-                    const double ms = double(qpcNow.QuadPart - ctx.fgLastPrepareQpc) * 1000.0 / double(qpcFreq.QuadPart);
-                    deltaMs = (float)std::min(std::max(ms, 1.0), 100.0);
-                }
-                ctx.fgLastPrepareQpc = qpcNow.QuadPart;
-                prep.frameTimeDelta = deltaMs;
-            }
-            prep.unused_reset = false;
-            prep.cameraNear = consts->cameraNear;
-            prep.cameraFar = consts->cameraFar;
-            prep.cameraFovAngleVertical = consts->cameraFOV;
-            prep.viewSpaceToMetersFactor = kSkyrimViewSpaceToMeters;
-            prep.depth = depthRes;
-            prep.motionVectors = mvecRes;
-            {
-                std::lock_guard<std::mutex> frameLock(ctx.frameMutex);
-                ctx.pendingFrame = {};
-                prep.frameID = ctx.frameID;
-                frame.frameID = prep.frameID;
-                ffxReturnCode_t prepareRc = FFX_API_RETURN_ERROR;
-                {
-                    std::lock_guard<std::mutex> dispatchLock(g_fgDispatchMutex);
-                    if (ctx.fgContext && ctx.fgSwapchainContext && ctx.fgWrappedSwapchain != VK_NULL_HANDLE)
-                        prepareRc = ffxDispatchSEH(
-                            ctx.ffxApi, &ctx.fgContext, &prep.header, ctx.dispatchFaulted);
-                }
-                if (prepareRc == FFX_API_RETURN_OK) {
-                    frame.prepared = true;
-                    ctx.pendingFrame = frame;
-                    evaluationResult = Result::eOk;
-                    evaluationGuard.accepted = true;
+            // Capture HUDLessColor for present-time UI extraction. Its exact format and current DXVK layout must
+            // match the frame-generation backbuffer contract.
+            if (chi::Resource hres = hudless; hres && hres->native) {
+                chi::ResourceDescription hdesc{};
+                ctx.compute->getResourceDescription(hres, hdesc);
+                VkImage himage = (VkImage)hres->native;
+                const VkFormat hfmt = (VkFormat)hdesc.nativeFormat;
+                const bool compatible = ctx.fgBackBufferVkFormat != VK_FORMAT_UNDEFINED &&
+                    hfmt == ctx.fgBackBufferVkFormat;
+                if (compatible) {
+                    // Flush attachment/compute writes to HUDLessColor so present-time FFX compute and copy reads see the rendered scene.
+                    if (ctx.vkCmdPipelineBarrier) {
+                        VkImageLayout hlayout = (VkImageLayout)hres->state;
+                        VkImageMemoryBarrier mb{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+                        mb.oldLayout = hlayout;
+                        mb.newLayout = hlayout;
+                        mb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        mb.image = himage;
+                        mb.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
+                        mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+                        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+                        ctx.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            0, 0, nullptr, 0, nullptr, 1, &mb);
+                    }
+                    VkImageCreateInfo hinfo = imageInfoFromDesc(hdesc);
+                    FfxApiResourceDescription hfdesc = ffxApiGetImageResourceDescriptionVK(himage, hinfo, FFX_API_RESOURCE_USAGE_READ_ONLY);
+                    frame.hudlessResource = ffxApiGetResourceVK(
+                        reinterpret_cast<void*>(himage), hfdesc, layoutToFfxState((VkImageLayout)hres->state));
+                    frame.haveHudless = frame.hudlessResource.resource != nullptr;
+                    if (frame.haveHudless) {
+                        frame.hudlessCompatible = true;
+                        hudlessWrapped = true;
+                    }
                 } else {
-                    SL_LOG_ERROR("sl.fsr_g: FrameGenerationPrepare failed 0x%08X", (uint32_t)prepareRc);
-                    evaluationResult = Result::eErrorComputeFailed;
+                    SL_LOG_WARN("sl.fsr_g: HUD-less format %d does not match backbuffer format %d",
+                        (int)hfmt, (int)ctx.fgBackBufferVkFormat);
+                }
+            }
+
+            if (!hudlessWrapped) {
+                evaluationResult = Result::eErrorComputeFailed;
+            } else {
+                ffxDispatchDescFrameGenerationPrepare prep{};
+                prep.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
+                prep.flags = 0;
+                prep.commandList = reinterpret_cast<void*>(cmd);
+                prep.renderSize = { renderW, renderH };
+                prep.jitterOffset = jitterOffset;
+                prep.motionVectorScale = motionVectorScale;
+                // Real frame delta (QPC between prepares), not a hardcoded 60Hz value:
+                // FFX scales its motion field by this, so at uncapped/high FPS a wrong
+                // constant mis-scales interpolation motion.
+                {
+                    LARGE_INTEGER qpcNow;
+                    QueryPerformanceCounter(&qpcNow);
+                    float deltaMs = 16.6f;
+                    if (ctx.fgLastPrepareQpc) {
+                        LARGE_INTEGER qpcFreq;
+                        QueryPerformanceFrequency(&qpcFreq);
+                        const double ms = double(qpcNow.QuadPart - ctx.fgLastPrepareQpc) * 1000.0 / double(qpcFreq.QuadPart);
+                        deltaMs = (float)std::min(std::max(ms, 1.0), 100.0);
+                    }
+                    ctx.fgLastPrepareQpc = qpcNow.QuadPart;
+                    prep.frameTimeDelta = deltaMs;
+                }
+                prep.unused_reset = false;
+                prep.cameraNear = consts->cameraNear;
+                prep.cameraFar = consts->cameraFar;
+                prep.cameraFovAngleVertical = consts->cameraFOV;
+                prep.viewSpaceToMetersFactor = kSkyrimViewSpaceToMeters;
+                prep.depth = depthRes;
+                prep.motionVectors = mvecRes;
+                // FSR 3.1.4+ requires camera position and basis vectors chained after the prepare descriptor.
+                ffxDispatchDescFrameGenerationPrepareCameraInfo cameraInfo{};
+                cameraInfo.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_CAMERAINFO;
+                cameraInfo.cameraPosition[0] = consts->cameraPos.x;
+                cameraInfo.cameraPosition[1] = consts->cameraPos.y;
+                cameraInfo.cameraPosition[2] = consts->cameraPos.z;
+                cameraInfo.cameraUp[0] = consts->cameraUp.x;
+                cameraInfo.cameraUp[1] = consts->cameraUp.y;
+                cameraInfo.cameraUp[2] = consts->cameraUp.z;
+                cameraInfo.cameraRight[0] = consts->cameraRight.x;
+                cameraInfo.cameraRight[1] = consts->cameraRight.y;
+                cameraInfo.cameraRight[2] = consts->cameraRight.z;
+                cameraInfo.cameraForward[0] = consts->cameraFwd.x;
+                cameraInfo.cameraForward[1] = consts->cameraFwd.y;
+                cameraInfo.cameraForward[2] = consts->cameraFwd.z;
+                prep.header.pNext = &cameraInfo.header;
+                {
+                    std::lock_guard<std::mutex> frameLock(ctx.frameMutex);
+                    ctx.pendingFrame = {};
+                    prep.frameID = ctx.frameID;
+                    frame.frameID = prep.frameID;
+                    ffxReturnCode_t prepareRc = FFX_API_RETURN_ERROR;
+                    {
+                        std::lock_guard<std::mutex> dispatchLock(g_fgDispatchMutex);
+                        if (ctx.fgContext && ctx.fgSwapchainContext && ctx.fgWrappedSwapchain != VK_NULL_HANDLE)
+                            prepareRc = ffxDispatchSEH(
+                                ctx.ffxApi, &ctx.fgContext, &prep.header, ctx.dispatchFaulted);
+                    }
+                    if (prepareRc == FFX_API_RETURN_OK) {
+                        frame.prepared = true;
+                        ctx.pendingFrame = frame;
+                        evaluationResult = Result::eOk;
+                        evaluationGuard.accepted = true;
+                    } else {
+                        SL_LOG_ERROR("sl.fsr_g: FrameGenerationPrepare failed 0x%08X", (uint32_t)prepareRc);
+                        evaluationResult = Result::eErrorComputeFailed;
+                    }
                 }
             }
         }
